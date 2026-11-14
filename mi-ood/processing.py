@@ -1,10 +1,15 @@
 import random
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
+import mne
 import numpy as np
 import pandas as pd
 from moabb.paradigms import MotorImagery
 import moabb.datasets as datasets
+import moabb.datasets.wang2026 as wang_module
+from scipy.io import loadmat
 from sklearn.base import clone
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -86,12 +91,37 @@ def summarize_results(dataset, experiment, metric="MI_BA"):
     data = pd.concat([pd.read_csv(path) for path in files], ignore_index=True)
     return data.groupby("method").agg(metric=(metric, "mean"), n=("subject", "nunique"))
 
+def summarize_results_by_subject(dataset, experiment, metric="MI_BA"):
+    files = sorted( (Path("results") / experiment).glob(  f"{dataset}__sub-*__{experiment}__*.csv" ) )
+    if not files:
+        return pd.DataFrame()
+
+    data = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
+
+    summary = data.groupby("method").agg(
+        mean=(metric, "mean"),
+        n=("subject", "nunique"),
+    ).rename(columns={"mean": metric})
+
+    by_subject = data.pivot( index="method", columns="subject", values=metric ).rename(columns=lambda s: f"sub-{int(s):02d}")
+
+    return summary.join(by_subject).sort_values(metric, ascending=False)
+
+WANG2026_45_SUBJECTS = sorted(set(range(1, 40)) - {1, 2, 4, 5, 6, 9, 10, 17, 24, 29})
+
 def get_subjects(name, n=None, seed=42):
+    if name == "Stieger2021_fix":
+        name = "Stieger2021"
+    wang_45 = name == "Wang2026_45"
+    if name in {"Wang2026_fix", "Wang2026_45"}:
+        name = "Wang2026"
     if name in {"Yang2025_3C", "Yang2025_3C_origwin", "Yang2025_3C_fixwin"}:
         dataset = datasets.Yang2025(paradigm_type="3C")
     else:
         dataset = getattr(datasets, name)()
     subjects = dataset.subject_list
+    if wang_45:
+        subjects = [s for s in subjects if s in WANG2026_45_SUBJECTS]
     if n is None or n >= len(subjects):
         return subjects
     return sorted(random.Random(seed).sample(subjects, n))
@@ -122,9 +152,29 @@ def select_trials(data, n_trials=None, random_state=42):
     return X[indices], y[indices]
 
 # n_trials 90
-def load_subject_data(name, subject, val_size=0, n_trials=None, channels=None, 
-                      include_feet=False, within_session=False, test_size=0.25, session_index=0, random_state=42 ):
-    kwargs = {} if name == "Weibo2014" else {"sessions": [0, 1]}
+def load_subject_data(name, subject, val_size=0, n_trials=None, channels=None,
+                      id_classes=HANDS, ood_classes=(), within_session=False, test_size=0.25,
+                      session_index=0, sfreq=250, duration=4.0, random_state=42,
+                      print_count=False,
+                      fmin = 8, fmax=32 ):
+    stieger_fix = name == "Stieger2021_fix"
+    if stieger_fix: name = "Stieger2021"
+    wang_45 = name == "Wang2026_45"
+    wang_fix = name in {"Wang2026_fix", "Wang2026_45"}
+    if wang_45 and subject not in WANG2026_45_SUBJECTS:
+        raise ValueError(f"Wang2026_45: subject {subject} has no session 4/5.")
+
+    if wang_fix:
+        name = "Wang2026"
+    if name == "Weibo2014":
+        kwargs = {}
+    elif name == "Stieger2021":
+        kwargs = {"sessions": [2, 3], "interval": [0, duration]}
+    elif name == "Wang2026":
+        kwargs = {"sessions": [4, 5] if wang_45 else [3, 4]}
+    else:
+        kwargs = {"sessions": [0, 1]}
+
     yang_fixed_window = name == "Yang2025_3C_fixwin"
 
     if name == "Zhou2020":
@@ -134,50 +184,122 @@ def load_subject_data(name, subject, val_size=0, n_trials=None, channels=None,
         kwargs["paradigm_type"] = "3C"
 
     dataset = getattr(datasets, name)(**kwargs)
+
+    if wang_fix:
+        raw_samples = int(round(duration * wang_module._SFREQ))
+        dataset.interval = [0.0, (raw_samples - 1) / wang_module._SFREQ]
     if yang_fixed_window:
         dataset.interval = (0, 4)
-    feet_events = ["left_foot", "right_foot"] if name == "TTK" else ["feet"]
-    events = list(HANDS) + (feet_events if include_feet else [])
 
+    if isinstance(ood_classes, str):
+        ood_classes = (ood_classes,)
+    ood_classes = tuple(dict.fromkeys(ood_classes))
+
+    if set(ood_classes) & set(id_classes):
+        raise ValueError("ID and OOD should be different.")
+
+    bnci_rest = name == "BNCI2014_001" and "rest" in ood_classes
+    if bnci_rest and within_session:
+        raise ValueError("BNCI rest: only for cross-session")
+    zhou_rest = name == "Zhou2016" and "rest" in ood_classes
+    if zhou_rest and (within_session or not 0 < duration <= 3):
+        raise ValueError("Zhou2016 rest: cross-session, 0 < duration <= 3.")
+    events = list(id_classes) + [c for c in ood_classes if not ((bnci_rest or zhou_rest) and c == "rest")]
+
+    missing = set(events) - set(dataset.event_id)
+    if missing:
+        raise ValueError(
+            f"{name}: no events {sorted(missing)}; "
+            f"available {list(dataset.event_id)}."
+        )
+    tadd = 0.0
+    if stieger_fix: tadd = 2.0
     paradigm = MotorImagery(
         events=events,
         n_classes=len(events),
-        fmin=8,
-        fmax=32,
-        resample=250,
+        fmin=fmin,
+        fmax=fmax,
+        resample=sfreq,
         channels=channels,
         baseline=None,
-        tmin=0,
-        tmax=min(4, dataset.interval[1] - dataset.interval[0]),
+        tmin=0+tadd,
+        tmax=tadd+min(duration, dataset.interval[1] - dataset.interval[0]),
     )
 
-    X, y, metadata = paradigm.get_data(dataset, subjects=[subject])
+    load_context = (
+        patch.object(wang_module, "_NOMINAL_TRIAL_SAMPLES", raw_samples)
+        if wang_fix else nullcontext()
+    )
 
-    # 4s * 250 hz = 1000
-    X = X[..., :1000]
+    with load_context:
+        X, y, metadata = paradigm.get_data(
+            dataset,
+            subjects=[subject],
+            cache_config={"use": False} if ( wang_fix or stieger_fix ) else None,
+        )
 
-    if X.shape[-1] != 1000:
-        raise ValueError("Expected 1000.")
+    n_times = int(round(duration * sfreq))
+    X = X[..., :n_times]
+
+    if X.shape[-1] != n_times:
+        raise ValueError(
+            f"Expected {n_times} samples ({duration} s at {sfreq} Hz), "
+            f"got {X.shape[-1]}."
+        )
 
     sessions = sorted(metadata["session"].unique())
-    is_id = np.isin(y, HANDS)
+    is_id = np.isin(y, id_classes)
+    is_ood = np.isin(y, ood_classes)
+
     if within_session:
-        in_session = metadata["session"].eq( sessions[session_index] ).to_numpy()
+        in_session = metadata["session"].eq(sessions[session_index]).to_numpy()
         id_idx = np.flatnonzero(in_session & is_id)
-        train_idx, test_idx = train_test_split( id_idx, test_size=test_size, stratify=y[id_idx], random_state=42 )
-        ood_idx = np.flatnonzero(in_session & ~is_id)
+
+        train_idx, test_idx = train_test_split(id_idx, test_size=test_size, stratify=y[id_idx], random_state=random_state)
+
+        ood_idx = np.flatnonzero(in_session & is_ood)
         test_idx = np.r_[test_idx, ood_idx]
+
     else:
-        train_idx = np.flatnonzero( metadata["session"].eq(sessions[0]).to_numpy() & is_id )
-        test_idx = np.flatnonzero( metadata["session"].eq(sessions[1]).to_numpy() )
+        if len(sessions) < 2:
+            raise ValueError(
+                f"{name}: для cross-session нужны две сессии."
+            )
+
+        train_idx = np.flatnonzero(metadata["session"].eq(sessions[0]).to_numpy() & is_id)
+        test_idx = np.flatnonzero(metadata["session"].eq(sessions[1]).to_numpy() & (is_id | is_ood))
+
+    missing_test = set(events) - set(y[test_idx])
+    if missing_test:
+        raise ValueError(
+            f"В test отсутствуют классы: {sorted(missing_test)}."
+        )
 
     train_data = (X[train_idx], y[train_idx])
     test_data = (X[test_idx], y[test_idx])
+
+    if bnci_rest:
+        block = loadmat(dataset.data_path(subject)[1], simplify_cells=True)["data"][0]
+        names = "Fz FC3 FC1 FCz FC2 FC4 C5 C3 C1 Cz C2 C4 C6 CP3 CP1 CPz CP2 CP4 P1 Pz P2 POz".split()
+        raw = mne.io.RawArray(block["X"][:, :22].T * 1e-6, mne.create_info(names, block["fs"], "eeg"), verbose=False)
+        raw.pick(names if channels is None else channels).filter(8, 32, method="iir", verbose=False)
+        ev = mne.make_fixed_length_events(raw, start=2, stop=raw.times[-1] - 2, duration=duration)
+        rest = mne.Epochs(raw, ev, tmin=0, tmax=duration, baseline=None, preload=True, verbose=False)
+        rest = rest.resample(sfreq, verbose=False).get_data()[..., :n_times] * 1e6
+        test_data = (np.concatenate([test_data[0], rest]), np.concatenate([test_data[1], np.full(len(rest), "rest")]))
+    if zhou_rest:
+        rest_paradigm = MotorImagery(events=list(dataset.event_id), n_classes=3, fmin=8, fmax=32, resample=sfreq, channels=channels, baseline=None, tmin=5.5, tmax=5.5 + duration)
+        rest, _, rest_meta = rest_paradigm.get_data(dataset, subjects=[subject], cache_config={"use": False})
+        rest = rest[rest_meta["session"].to_numpy() == sessions[1], :, :n_times]
+        test_data = (np.concatenate([test_data[0], rest]), np.concatenate([test_data[1], np.full(len(rest), "rest")]))
     val_data = None
 
     if val_size:
-        X_train, X_val, y_train, y_val = train_test_split(*train_data, test_size=val_size, stratify=train_data[1], random_state=42)
+        X_train, X_val, y_train, y_val = train_test_split(*train_data, test_size=val_size, stratify=train_data[1], random_state=random_state)
         train_data, val_data = (X_train, y_train), (X_val, y_val)
 
     train_data = select_trials(train_data, n_trials, random_state)
+    if print_count:
+        n_val = 0 if val_data is None else len(val_data[1])
+        print(f"{name} {subject}: {len(train_data[1])}/{n_val}/{len(test_data[1])}")
     return train_data, val_data, test_data

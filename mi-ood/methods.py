@@ -18,7 +18,6 @@ from sklearn.covariance import LedoitWolf
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
-from statsmodels.regression.linear_model import burg
 from statsmodels.tsa.api import VAR
 
 from torch import nn
@@ -101,15 +100,6 @@ class MicrostateFeatures(TransformerMixin, BaseEstimator):
             values = [p[f"{s}_{m}"] for s in self.model_.cluster_names for m in ("meandurs", "occurrences", "timecov", "mean_corr", "gev")]
             rows.append(np.r_[values, seg.compute_transition_matrix()[~np.eye(self.k, dtype=bool)]])
         return np.asarray(rows)
-
-def ar_features(X, order=10):
-    return np.array([np.concatenate([burg(x, order=order)[0] for x in trial]) for trial in X])
-
-def ar_features_var(X, order=10):
-    def features(x):
-        a, v = burg(x, order=order)
-        return np.r_[a, np.log(max(v, 1e-12))]
-    return np.array([np.concatenate([features(x) for x in trial]) for trial in X])
 
 def var_features(X, order=2):
     features = []
@@ -340,11 +330,4 @@ class EEGNetTempDens( BaseEstimator ):
 
     def predict( self, X ):
         return self.details( X )["class_prediction"]
-
-class KNNDistance(BaseEstimator):
-    def __init__(self, k=10): self.k = k
-    def fit(self, X, y=None):
-        self.nn_ = NearestNeighbors(n_neighbors=min(self.k, len(X)), n_jobs=1).fit(X)
-        return self
-    def score_samples(self, X): return -self.nn_.kneighbors(X)[0][:, -1]
 
