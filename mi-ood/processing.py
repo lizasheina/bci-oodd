@@ -3,7 +3,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
-from IPython.display import display
+from IPython.display import display, HTML
 
 import mne
 import numpy as np
@@ -115,10 +115,35 @@ def summarize_results_by_subject(dataset, experiment, metric="MI_BA", experiment
 
     return summary.join(by_subject).sort_values(metric, ascending=False)
 
+#BEST_CELL_STYLE = "background-color: rgba(0, 128, 0, 0.50); font-weight: 600;" # background-color: green; color: #006100;
+BEST_CELL_STYLE = (
+    "background-color: rgba(0, 128, 0, 0.35); "
+    "display: block; "
+    "width: 100%; "
+    "box-sizing: border-box; "
+    "font-weight: 600;"
+)
+def _format_best_value(value, best):
+    if pd.isna(value):
+        return ""
+    text = f"{value:.3f}"
+    if value == best:
+        return f'<span style="{BEST_CELL_STYLE}">{text}</span>'
+    return text
+
 def display_summary_by_subject(dataset, experiment, experiment_type="mi", metric="MI_BA"):
     table = summarize_results_by_subject(dataset, experiment, metric=metric, experiment_type=experiment_type)
+    #subject_cols = [c for c in table.columns if c.startswith("sub-")]
+    #display(table.round(3).style.highlight_max(axis=0, subset=subject_cols, color="green"))
     subject_cols = [c for c in table.columns if c.startswith("sub-")]
-    display(table.round(3).style.highlight_max(axis=0, subset=subject_cols, color="green"))
+    html_table = table.round(3).copy()
+    html_table[subject_cols] = html_table[subject_cols].astype(object)
+
+    for col in subject_cols:
+        best = html_table[col].max()
+        html_table[col] = [ _format_best_value(value, best) for value in html_table[col] ]
+
+    display(HTML(html_table.to_html(escape=False)))
 
 def display_summary_by_dataset(experiment, mi_methods, ood_methods, experiment_specs=None, datasets=None, res_path=Path("results")):
     if experiment_specs is None:
@@ -147,20 +172,33 @@ def display_summary_by_dataset(experiment, mi_methods, ood_methods, experiment_s
     dataset_cols = means.columns.tolist()
     table = table.sort_values(["task", "mean_subjects"], ascending=[True, False]).round(3)
 
-    def highlight_best(data):
-        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+    #def highlight_best(data):
+    #    styles = pd.DataFrame("", index=data.index, columns=data.columns)
 
-        for task in data.index.get_level_values("task").unique():
-            rows = data.index.get_level_values("task") == task
-            best = data.loc[rows, dataset_cols].eq(data.loc[rows, dataset_cols].max())
-            styles.loc[rows, dataset_cols] = best.replace({
-                True: "background-color: green",
-                False: "",
-            })
+        #for task in data.index.get_level_values("task").unique():
+        #    rows = data.index.get_level_values("task") == task
+        #    best = data.loc[rows, dataset_cols].eq(data.loc[rows, dataset_cols].max())
+        #    styles.loc[rows, dataset_cols] = best.replace({
+        #        True: "background-color: green",
+        #        False: "",
+        #    })
 
-        return styles
+        #return styles
 
-    display(table.style.apply(highlight_best, axis=None))
+    #display(table.style.apply(highlight_best, axis=None))
+    
+    html_table = table.copy()
+    html_table[dataset_cols] = html_table[dataset_cols].astype(object)
+
+    for task in html_table.index.get_level_values("task").unique():
+        rows = html_table.index.get_level_values("task") == task
+
+        for col in dataset_cols:
+            best = table.loc[rows, col].max()
+            html_table.loc[rows, col] = [ _format_best_value(value, best) for value in table.loc[rows, col] ]
+
+    display(HTML(html_table.to_html(escape=False)))
+    
 
 
 WANG2026_45_SUBJECTS = sorted(set(range(1, 40)) - {1, 2, 4, 5, 6, 9, 10, 17, 24, 29})
