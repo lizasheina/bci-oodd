@@ -17,6 +17,7 @@ TTK_DAYS = {
     5: (5, 7), 6: (9, 12), 7: (15, 16),
 }
 TTK_EVENTS = {
+    "rest": 1,
     "right_hand": 5, "left_hand": 7,
     "right_foot": 9, "left_foot": 11,
 }
