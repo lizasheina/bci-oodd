@@ -120,7 +120,7 @@ def display_summary_by_subject(dataset, experiment, experiment_type="mi", metric
     subject_cols = [c for c in table.columns if c.startswith("sub-")]
     display(table.round(3).style.highlight_max(axis=0, subset=subject_cols, color="green"))
 
-def display_summary_by_dataset(experiment, mi_methods, ood_methods, experiment_specs=None, res_path=Path("results")):
+def display_summary_by_dataset(experiment, mi_methods, ood_methods, experiment_specs=None, datasets=None, res_path=Path("results")):
     if experiment_specs is None:
         experiment_specs = [("MI BA", "mi", "MI_BA"), ("MI AUROC", "mi", "MI_AUROC"), ("OOD", "ood", "OOD_AUROC")]
 
@@ -135,6 +135,8 @@ def display_summary_by_dataset(experiment, mi_methods, ood_methods, experiment_s
         d = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
         methods = ood_methods if experiment_type.startswith("ood") else mi_methods
         d = d[d["method"].isin(methods)]
+        if datasets is not None:
+            d = d[d["dataset"].isin(datasets)]
         parts.append(d.assign(task=task, score=d[metric]))
 
     r = pd.concat(parts, ignore_index=True)
