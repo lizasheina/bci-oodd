@@ -3,6 +3,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
+from IPython.display import display
+
 import mne
 import numpy as np
 import pandas as pd
@@ -17,6 +19,8 @@ from sklearn.model_selection import train_test_split
 import dataset_ttk
 
 RESULTS = Path( "results" )
+def experiment_dir(experiment, experiment_type, res_path=RESULTS):
+    return Path(res_path) / experiment / experiment_type
 
 HANDS = ("left_hand", "right_hand")
 
@@ -63,36 +67,40 @@ def MI_(test_data, model):
     return roc_auc_score(y_test == model.classes_[1], scores)
 
 def result_path(result):
-    filename = f"{result['dataset']}__sub-{result['subject']:02d}__{result['experiment']}__{result['method']}.csv"
-    return Path("results") / result["experiment"] / filename
+    filename = ( f"{result['dataset']}__sub-{result['subject']:02d}__{result['method']}.csv" )
+    return experiment_dir( result["experiment"], result["experiment_type"] ) / filename
 
 def save_result(result):
     path = result_path(result)
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([result]).to_csv(path, index=False)
 
-def create_exp_file( mi_exp, ood_exp, res_path ):
+def create_exp_file( experiment, experiment_types=None, res_path=RESULTS ):
+    experiment_root = Path(res_path) / experiment
+    if experiment_types is None:
+        experiment_types = sorted( path.name for path in experiment_root.iterdir() if path.is_dir() )
     parts = []
-    for task, experiment in [("MI", mi_exp), ("OOD", ood_exp)]:
-        files = sorted((res_path / experiment).glob("*.csv"))
-        parts.extend(pd.read_csv(p).assign(task=task, source_file=p.name) for p in files)
+    for experiment_type in experiment_types:
+        files = sorted( ( res_path / experiment / experiment_type ).glob("*.csv") )
+        parts.extend( pd.read_csv(p).assign( task=experiment_type, experiment=experiment, experiment_type=experiment_type, source_file=p.name ) for p in files )
 
     data = pd.concat(parts, ignore_index=True)
-    output = res_path / f"{mi_exp}__{ood_exp}__all.csv"
+    output = res_path / f"{experiment}.csv"
     data.to_csv(output, index=False)
     print(f"Saved to {output}")
     return output
 
 
-def summarize_results(dataset, experiment, metric="MI_BA"):
-    files = list( (Path("results") / experiment).glob(f"{dataset}__sub-*__{experiment}__*.csv") )
+def summarize_results(dataset, experiment, metric="MI_BA", experiment_type="mi"):
+    files = list( (Path("results") / experiment / experiment_type).glob(f"{dataset}__sub-*__*.csv") )
     if not files:
         return pd.DataFrame()
     data = pd.concat([pd.read_csv(path) for path in files], ignore_index=True)
-    return data.groupby("method").agg(metric=(metric, "mean"), n=("subject", "nunique"))
+    #return data.groupby("method").agg(metric=(metric, "mean"), n=("subject", "nunique"))
+    return  data.groupby("method").agg(**{metric: (metric, "mean"), "n": ("subject", "nunique")})
 
-def summarize_results_by_subject(dataset, experiment, metric="MI_BA"):
-    files = sorted( (Path("results") / experiment).glob(  f"{dataset}__sub-*__{experiment}__*.csv" ) )
+def summarize_results_by_subject(dataset, experiment, metric="MI_BA", experiment_type="mi"):
+    files = sorted( (Path("results") / experiment / experiment_type).glob(f"{dataset}__sub-*__*.csv") )
     if not files:
         return pd.DataFrame()
 
@@ -106,6 +114,52 @@ def summarize_results_by_subject(dataset, experiment, metric="MI_BA"):
     by_subject = data.pivot( index="method", columns="subject", values=metric ).rename(columns=lambda s: f"sub-{int(s):02d}")
 
     return summary.join(by_subject).sort_values(metric, ascending=False)
+
+def display_summary_by_subject(dataset, experiment, experiment_type="mi", metric="MI_BA"):
+    table = summarize_results_by_subject(dataset, experiment, metric=metric, experiment_type=experiment_type)
+    subject_cols = [c for c in table.columns if c.startswith("sub-")]
+    display(table.round(3).style.highlight_max(axis=0, subset=subject_cols, color="green"))
+
+def display_summary_by_dataset(experiment, mi_methods, ood_methods, experiment_specs=None, res_path=Path("results")):
+    if experiment_specs is None:
+        experiment_specs = [("MI BA", "mi", "MI_BA"), ("MI AUROC", "mi", "MI_AUROC"), ("OOD", "ood", "OOD_AUROC")]
+
+    parts = []
+    mi_methods, ood_methods = set(mi_methods), set(ood_methods)
+
+    for task, experiment_type, metric in experiment_specs:
+        files = sorted((res_path / experiment / experiment_type).glob("*.csv"))
+        if not files:
+            continue
+
+        d = pd.concat([pd.read_csv(p) for p in files], ignore_index=True)
+        methods = ood_methods if experiment_type.startswith("ood") else mi_methods
+        d = d[d["method"].isin(methods)]
+        parts.append(d.assign(task=task, score=d[metric]))
+
+    r = pd.concat(parts, ignore_index=True)
+    means = r.groupby(["task", "method", "dataset"])["score"].mean().unstack("dataset")
+    table = means.join(r.groupby(["task", "method"])["score"].agg(mean_subjects="mean", sd="std", n="count"))
+    table["mean_datasets"] = means.mean(axis=1)
+
+    dataset_cols = means.columns.tolist()
+    table = table.sort_values(["task", "mean_subjects"], ascending=[True, False]).round(3)
+
+    def highlight_best(data):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+
+        for task in data.index.get_level_values("task").unique():
+            rows = data.index.get_level_values("task") == task
+            best = data.loc[rows, dataset_cols].eq(data.loc[rows, dataset_cols].max())
+            styles.loc[rows, dataset_cols] = best.replace({
+                True: "background-color: green",
+                False: "",
+            })
+
+        return styles
+
+    display(table.style.apply(highlight_best, axis=None))
+
 
 WANG2026_45_SUBJECTS = sorted(set(range(1, 40)) - {1, 2, 4, 5, 6, 9, 10, 17, 24, 29})
 
