@@ -10,19 +10,19 @@ MI_METRICS = ("MI_BA", "MI_AUROC")
 def rank_profiles(x):
     return x.rank().T.groupby(level="metric").mean().T
 
-def adjusted_rho(x):
+def adjusted_rho(x, ood_metric="OOD_AUROC"):
     z = pd.get_dummies(rank_profiles(x).reset_index(), columns=["dataset"], drop_first=True, dtype=float)
-    return np.array([pg.partial_corr(data=z, x=m, y="OOD_AUROC", covar=z.filter(like="dataset_").columns.tolist(), method="spearman")["r"].iloc[0] for m in MI_METRICS])
+    return np.array([pg.partial_corr(data=z, x=m, y=ood_metric, covar=z.filter(like="dataset_").columns.tolist(), method="spearman")["r"].iloc[0] for m in MI_METRICS])
 
-def weighted_rho(x):
+def weighted_rho(x, ood_metric="OOD_AUROC"):
     parts = [g for _, g in x.groupby(level="dataset")]
-    return np.average([rank_profiles(g).corr(method="spearman").loc[list(MI_METRICS), "OOD_AUROC"] for g in parts], axis=0, weights=[len(g) for g in parts])
+    return np.average([rank_profiles(g).corr(method="spearman").loc[list(MI_METRICS), ood_metric] for g in parts], axis=0, weights=[len(g) for g in parts])
 
-def bootstrap_ci(x, n=4999):
+def bootstrap_ci(x, n=4999, ood_metric="OOD_AUROC"):
     groups = tuple(x.groupby(level="dataset").indices.values())
-    return bootstrap(groups, lambda *idx: adjusted_rho(x.iloc[np.concatenate(idx)]), vectorized=False, n_resamples=n, method="percentile", rng=42).confidence_interval
+    return bootstrap(groups, lambda *idx: adjusted_rho(x.iloc[np.concatenate(idx)], ood_metric=ood_metric), vectorized=False, n_resamples=n, method="percentile", rng=42).confidence_interval
 
-def permutation_p(x, n=9999, statistic=adjusted_rho):
+def permutation_p(x, n=9999, statistic=adjusted_rho, ood_metric="OOD_AUROC"):
     rng = np.random.default_rng(42)
     groups = list(x.groupby(level="dataset").indices.values())
     null = []
@@ -31,9 +31,9 @@ def permutation_p(x, n=9999, statistic=adjusted_rho):
         for idx in groups:
             order[idx] = rng.permutation(idx)
         shuffled = x.copy()
-        shuffled.loc[:, "OOD_AUROC"] = x.iloc[order]["OOD_AUROC"].to_numpy()
-        null.append(statistic(shuffled))
-    return (1 + (np.abs(null) >= np.abs(statistic(x)) - 1e-12).sum(axis=0)) / (n + 1)
+        shuffled.loc[:, ood_metric] = x.iloc[order][ood_metric].to_numpy()
+        null.append(statistic(shuffled, ood_metric=ood_metric))
+    return (1 + (np.abs(null) >= np.abs(statistic(x, ood_metric=ood_metric)) - 1e-12).sum(axis=0)) / (n + 1)
 
 def overall_agreement(x, n=9999):
     rng = np.random.default_rng(42)
