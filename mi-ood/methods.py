@@ -7,16 +7,27 @@ from braindecode.models import EEGNet as EEGNetModel
 from braindecode.models import ShallowFBCSPNet
 from braindecode.util import set_random_seeds
 
+from moabb.pipelines.features import AugmentedDataset
+from moabb.pipelines.utils import FilterBank
 from pycrostates.cluster import ModKMeans
 from pycrostates.preprocessing import extract_gfp_peaks
+from pyriemann.estimation import Covariances
+from pyriemann.spatialfilters import CSP
+from pyriemann.tangentspace import TangentSpace
 
 from scipy.signal import butter, sosfiltfilt
-from scipy.special import logsumexp
+from scipy.special import logsumexp, xlogy
 
-from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.covariance import LedoitWolf
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import normalize
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.ensemble import ExtraTreesClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier, LocalOutlierFactor, NearestNeighbors
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import FunctionTransformer, RobustScaler, StandardScaler, normalize
+from sklearn.svm import OneClassSVM, SVC
 
 from statsmodels.tsa.api import VAR
 
@@ -120,6 +131,16 @@ class ClassMahalanobis(BaseEstimator):
         distances = [ self.covariance_.mahalanobis(X - mean) for mean in self.means_ ]
         return -np.min(distances, axis=0)
 
+class KNNDistance(BaseEstimator):
+    def __init__(self, k=10):
+        self.k = k
+
+    def fit(self, X, y=None):
+        self.nn_ = NearestNeighbors(n_neighbors=min(self.k, len(X)), n_jobs=1).fit(X)
+        return self
+
+    def score_samples(self, X):
+        return -self.nn_.kneighbors(X)[0][:, -1]
 
 class ShallowOOD(BaseEstimator):
     def __init__(self, method="energy", epochs=100, device="cpu", n_neighbors=10, n_mc=30):
@@ -202,7 +223,7 @@ class ShallowOOD(BaseEstimator):
         return -score
 
 class TempDensEEGNet( nn.Module ):
-    def __init__( self, channels ):
+    def __init__( self, channels, n_classes=2 ):
         super().__init__()
         self.block1 = nn.Sequential( 
             nn.ZeroPad2d( ( 124, 125, 0, 0 ) ), 
@@ -223,7 +244,7 @@ class TempDensEEGNet( nn.Module ):
             nn.AvgPool2d( ( 1, 8 ) ), 
             nn.Dropout( .5 ) 
         )
-        self.classifier = nn.Linear( 240, 2 )
+        self.classifier = nn.Linear( 240, n_classes )
 
     def forward( self, X ):
         features = self.block2( self.block1( X.unsqueeze( 1 ) ) ).flatten( 1 )
@@ -285,16 +306,19 @@ class EEGNetTempDens( BaseEstimator ):
 
     def _fit( self, X, y ):
         y = np.asarray( y )
-        if len( X ) != len( y ) or set( np.unique( y ) ) != set( HANDS ):
-            raise ValueError( "Fit requires only left_hand and right_hand, with one label per trial" )
+        if y.ndim != 1 or len( X ) != len( y ):
+            raise ValueError( "Expected one label per trial" )
+        self.classes_, y_encoded = np.unique( y, return_inverse=True )
+        if len( self.classes_ ) < 2:
+            raise ValueError( "Fit requires at least two ID classes" )
         torch.set_num_threads( self.threads ); torch.manual_seed( self.seed ); torch.use_deterministic_algorithms( True )
-        windows = tempdens_windows( X ); self.classes_ = np.asarray( HANDS )
-        self.network_ = TempDensEEGNet( windows.shape[2] ).to( self.device )
+        windows = tempdens_windows( X )
+        self.network_ = TempDensEEGNet( windows.shape[2], n_classes=len( self.classes_ ) ).to( self.device )
         flat = windows.reshape( -1, *windows.shape[2:] )
         self.mean_ = flat.mean( axis=( 0, 2 ), keepdims=True ).astype( np.float32 )
         self.std_ = flat.std( axis=( 0, 2 ), keepdims=True ).clip( 1e-6 ).astype( np.float32 )
         inputs = torch.from_numpy( ( flat - self.mean_ ) / self.std_ )
-        labels = np.repeat( np.searchsorted( self.classes_, y ), windows.shape[1] )
+        labels = np.repeat( y_encoded, windows.shape[1] )
         targets = torch.from_numpy( labels ).long()
         loader = torch.utils.data.DataLoader( torch.utils.data.TensorDataset( inputs, targets ), batch_size=self.batch_size, shuffle=True, generator=torch.Generator().manual_seed( self.seed ) )
         optimizer = torch.optim.Adam( self.network_.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay )
@@ -310,7 +334,7 @@ class EEGNetTempDens( BaseEstimator ):
 
         logits, features = self._encode( windows )
         self.memory_ = features.reshape( -1, features.shape[-1] ).astype( float )
-        self.class_means_ = np.stack( [ self.memory_[labels == c].mean( axis=0 ) for c in range( 2 ) ] )
+        self.class_means_ = np.stack( [ self.memory_[labels == c].mean( axis=0 ) for c in range( len( self.classes_ ) ) ] )
         covariance = np.cov( self.memory_, rowvar=False ) + self.cov_reg * np.eye( self.memory_.shape[1] )
         self.precision_ = np.linalg.pinv( covariance, hermitian=True )
         self.neighbors_ = NearestNeighbors( metric="euclidean", n_jobs=1 ).fit( self.memory_ )
@@ -331,3 +355,143 @@ class EEGNetTempDens( BaseEstimator ):
     def predict( self, X ):
         return self.details( X )["class_prediction"]
 
+class FeatureVote(ClassifierMixin, BaseEstimator):
+    def __init__(self, n_models=11, feature_fraction=0.5, use_entropy=False, random_state=42, classifier="lr", ensemble=None):
+        self.n_models = n_models
+        self.feature_fraction = feature_fraction
+        self.random_state = random_state
+        self.use_entropy = use_entropy
+        self.classifier = classifier
+        self.ensemble = ensemble
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        rng = np.random.default_rng(self.random_state)
+        n_features = int(X.shape[1] * self.feature_fraction)
+        self.models_ = []
+        classifiers = {
+            "lr": lambda: LogisticRegression(solver="saga", l1_ratio=0.5, C=1., max_iter=5000, random_state=self.random_state),
+            "lda": lambda: LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"),
+            "svm": lambda: CalibratedClassifierCV(make_pipeline(StandardScaler(), SVC(kernel="rbf", C=1.)), cv=3, ensemble=False),
+            "extra_trees": lambda: ExtraTreesClassifier(n_estimators=200, min_samples_leaf=3, random_state=self.random_state, n_jobs=1),
+            "knn": lambda: make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=5)),
+        }
+        ensemble = self.ensemble if self.ensemble is not None else {self.classifier: self.n_models}
+        for name, count in ensemble.items():
+            for _ in range(count):
+                indices = rng.choice(X.shape[1], size=n_features, replace=False)
+                model = classifiers[name]()
+                model.fit(X[:, indices], y)
+                self.models_.append((indices, model))
+
+        return self
+
+    def _votes(self, X):
+        predictions = np.array([model.predict(X[:, indices]) for indices, model in self.models_])
+        return np.column_stack([(predictions == label).mean(axis=0) for label in self.classes_])
+
+    def predict(self, X):
+        return self.classes_[self._votes(X).argmax(axis=1)]
+
+    def predict_proba(self, X):
+        return np.mean([model.predict_proba(X[:, indices]) for indices, model in self.models_], axis=0)
+
+    def score_samples(self, X):
+        votes = self._votes(X)
+        if self.use_entropy:
+            disagreement = -(votes * np.log(np.clip(votes, 1e-12, 1))).sum(axis=1)
+        else:
+            disagreement = 1 - votes.max(axis=1)
+        return -disagreement
+
+
+class MultiModel(BaseEstimator):
+    def __init__(self, mode="softvote", lag=9, C=1.0, n_neighbors=20,  nu=0.1, gamma="scale", agg="mean", random_state=42, classifier="lr"):
+        self.mode = mode
+        self.lag = lag
+        self.C = C
+        self.n_neighbors = n_neighbors
+        self.nu = nu
+        self.gamma = gamma
+        self.agg = agg
+        self.random_state = random_state
+        self.classifier = classifier
+
+    def fit(self, X, y):
+        self.__dict__.pop("voter_", None)
+        X = np.asarray(X, dtype=float)
+        self.classes_, labels = np.unique(y, return_inverse=True)
+        self.features_ = {
+            "acm": make_pipeline(
+                AugmentedDataset(order=2, lag=self.lag),
+                Covariances(estimator="cov"),
+                TangentSpace(metric="riemann"),
+                StandardScaler()),
+            "fbcsp": make_pipeline(
+                FunctionTransformer(filter_bands),
+                FilterBank(make_pipeline(Covariances(estimator="oas"),
+                    CSP(nfilter=min(4, X.shape[1]), metric="euclid", log=True))),
+                StandardScaler()),
+            "var": make_pipeline(
+                FunctionTransformer(var_features, kw_args={"order": 2}),
+                StandardScaler()),
+            "bandpower": make_pipeline(
+                FunctionTransformer(log_bandpower),
+                StandardScaler()),
+        }
+        self.branch_names_ = tuple(self.features_)
+        if self.mode == "softvote":
+            classifiers = {
+                "lr": LogisticRegression(C=self.C, max_iter=5000, random_state=self.random_state),
+                "lda": LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto"),
+                "extra_trees": ExtraTreesClassifier(n_estimators=200, min_samples_leaf=3, random_state=self.random_state, n_jobs=1),
+                "svm": SVC(kernel="rbf", C=self.C, gamma=self.gamma, probability=True, random_state=self.random_state),
+            }
+            self.models_ = { name: clone(classifiers[self.classifier]) for name in self.branch_names_ }
+            branches = [ (name, make_pipeline(self.features_[name], model))
+                          for name, model in self.models_.items() ]
+            self.voter_ = VotingClassifier(branches, voting="soft").fit(X, y)
+            self.classes_ = self.voter_.classes_
+            return self
+        elif self.mode == "lof":
+            self.models_ = { name: LocalOutlierFactor(n_neighbors=min(self.n_neighbors, len(X) - 1), novelty=True, n_jobs=1)
+                            for name in self.branch_names_ }
+        elif self.mode == "ocsvm":
+            self.models_ = { name: OneClassSVM(kernel="rbf", nu=self.nu, gamma=self.gamma)
+                             for name in self.branch_names_ }
+        elif self.mode == "mahalanobis":
+            self.models_ = { name: ClassMahalanobis() for name in self.branch_names_ }
+        else:
+            raise ValueError("Unsupported mode")
+
+        scores = []
+        for name, features in self.features_.items():
+            Z = features.fit_transform(X, labels)
+            model = self.models_[name].fit(Z, labels)
+            scores.append( -model.negative_outlier_factor_ if self.mode == "lof" else -model.score_samples(Z) )
+
+        self.score_scaler_ = RobustScaler().fit(np.column_stack(scores))
+        return self
+
+    def predict_proba(self, X):
+        return self.voter_.predict_proba(np.asarray(X, dtype=float))
+
+    def predict(self, X):
+        return self.classes_[self.predict_proba(X).argmax(axis=1)]
+
+    def score_samples(self, X):
+        if self.mode == "softvote":
+            p = self.predict_proba(X)
+            return np.sum(xlogy(p, p), axis=1) / np.log(len(self.classes_))
+
+        X = np.asarray(X, dtype=float)
+        scores = np.column_stack([-model.score_samples(self.features_[name].transform(X))
+                                  for name, model in self.models_.items()])
+        scores = self.score_scaler_.transform(scores)
+        if self.agg == "mean":
+            return -scores.mean(axis=1)
+        if self.agg == "max":
+            return -scores.max(axis=1)
+        if self.agg == "top2":
+            return -np.sort(scores, axis=1)[:, -2:].mean(axis=1)
+        raise ValueError("Unsupported aggregation")
